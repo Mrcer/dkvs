@@ -1,0 +1,7 @@
+[project]
+name = "dkvs"
+version = "0.1.0"
+description = "A Simple Distributed Key Value Store"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
