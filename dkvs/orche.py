@@ -1,6 +1,3 @@
-"""
-需要解决缓存问题
-"""
 import threading
 from queue import Queue
 from xmlrpc.server import SimpleXMLRPCServer
@@ -17,9 +14,7 @@ class Orchestrator:
         self.store_urls: dict[int, str] = {}
         self.num_stores = num_stores
         
-        # 提交过程：请求加入队列write_queue异步处理，数据保存在commit_table
-        # 单调读：读提交保证多次读取不会读到更旧的数据
-        # 单调写：带锁的提交表保证多次写只会保留最新版本
+        # 所有写入都会串行化写入缓存，所以能满足面向客户端的一致性
         self.commit_table_lock = threading.Lock()           # 提交表全局锁
         self.commit_table: dict[str, str] = {}         # 提交表，None表示数据提交中，但不脏，否则为脏
         self.write_queue: Queue[str] = Queue()

@@ -6,11 +6,9 @@ class Client:
         self.orchestrator = ServerProxy(f'http://localhost:{orchestrator_port}', allow_none=True)
     
     def put(self, key: str, value: str) -> bool:
-        """支持bytes或str"""
         return self.orchestrator.put(key, value)    # type: ignore
     
     def get(self, key: str) -> str:
-        """返回值：bytes"""
         return self.orchestrator.get(key)           # type: ignore
     
     def delete(self, key: str) -> bool:
