@@ -41,7 +41,9 @@ class Orchestrator:
             try:
                 with self.commit_table_lock:
                     if key not in self.commit_table:
-                        # 说明有队列中有多个写请求，而先前的请求已经处理了该请求的提交，因此可以跳过
+                        # 有两种可能：
+                        # 1. 队列中有多个写请求，而先前的请求已经处理了该请求的提交，因此可以跳过
+                        # 2. 在完成持久化前，数据就被删除了
                         continue
                     else:
                         value = self.commit_table.pop(key)
@@ -82,14 +84,20 @@ class Orchestrator:
             return ''
     
     def delete(self, key):
-        """客户端删除：只删除已提交"""
+        """客户端删除：删除缓存和远程存储"""
         if len(self.store_urls) != self.num_stores:
             logger.warning(f"Store not ready!")
 
+        success = False
+        with self.commit_table_lock:
+            if key in self.commit_table:
+                del self.commit_table[key]
+                success = True
         store_id = self._get_store_id(key)
         proxy = ServerProxy(self.store_urls[store_id], allow_none=True)
         try:
-            success = proxy.delete(key)
+            ret = proxy.delete(key)
+            success = ret or success
             return success
         except Exception as e:
             logger.error(f"Error deleting from Store-{store_id}: {e}")
