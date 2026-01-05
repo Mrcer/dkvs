@@ -7,6 +7,8 @@ from xmlrpc.server import SimpleXMLRPCServer
 from xmlrpc.client import ServerProxy
 import argparse
 import logging
+import time
+import random
 logger = logging.getLogger('store')
 logging.basicConfig(level=logging.DEBUG)
 
@@ -21,11 +23,13 @@ class Store:
         with self.lock:
             self.data[key] = value
             logger.debug(f"[Store-{self.store_id}] PUT `{key}` `{value}`")
+            time.sleep(random.random())
             return True
     
     def get(self, key):
         """获取值"""
         with self.lock:
+            time.sleep(random.random())
             if key in self.data:
                 val = self.data[key]
                 logger.debug(f"[Store-{self.store_id}] GET `{key}`, ok")
@@ -37,6 +41,7 @@ class Store:
     def delete(self, key):
         """删除键值对"""
         with self.lock:
+            time.sleep(random.random())
             if key in self.data:
                 del self.data[key]
                 logger.debug(f"[Store-{self.store_id}] DEL `{key}`, ok")

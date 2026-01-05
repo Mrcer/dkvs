@@ -1,3 +1,6 @@
+"""
+需要解决缓存问题
+"""
 import threading
 from queue import Queue
 from xmlrpc.server import SimpleXMLRPCServer
@@ -11,7 +14,7 @@ class Orchestrator:
     def __init__(self, num_stores=2):
         # Store节点代理
         self.stores_lock = threading.Lock()
-        self.stores: dict[int, ServerProxy] = {}
+        self.store_urls: dict[int, str] = {}
         self.num_stores = num_stores
         
         # 提交过程：请求加入队列write_queue异步处理，数据保存在commit_table
@@ -42,7 +45,8 @@ class Orchestrator:
                         continue
                     else:
                         value = self.commit_table.pop(key)
-                success = self.stores[store_id].put(key, value)
+                proxy = ServerProxy(self.store_urls[store_id], allow_none=True)
+                success = proxy.put(key, value)
                 if not success:
                     logger.error(f"Failed to write: key[:16]={key[:16]}")
             except Exception as e:
@@ -51,7 +55,7 @@ class Orchestrator:
     # RPC接口（供Client调用）
     def put(self, key, value) -> bool:
         """客户端写入：只入队，不等待"""
-        if len(self.stores) != self.num_stores:
+        if len(self.store_urls) != self.num_stores:
             logger.warning(f"Store not ready!")
 
         with self.commit_table_lock:
@@ -61,27 +65,31 @@ class Orchestrator:
         return True  # 已接受，异步写入
     
     def get(self, key) -> str:
-        """客户端读取：读已提交"""
-        if len(self.stores) != self.num_stores:
+        """客户端读取：先查缓存，保证读到最新修改"""
+        if len(self.store_urls) != self.num_stores:
             logger.warning(f"Store not ready!")
 
         store_id = self._get_store_id(key)
+        proxy = ServerProxy(self.store_urls[store_id], allow_none=True)
+        with self.commit_table_lock:
+            if key in self.commit_table:
+                return self.commit_table[key]
         try:
-            value = self.stores[store_id].get(key)
+            value = proxy.get(key)
             return value    # type: ignore
         except Exception as e:
-            logger.warning(f"Error reading from Store-{store_id}: {e}")
+            logger.error(f"Error reading from Store-{store_id}: {e}")
             return ''
     
     def delete(self, key):
         """客户端删除：只删除已提交"""
-        if len(self.stores) != self.num_stores:
+        if len(self.store_urls) != self.num_stores:
             logger.warning(f"Store not ready!")
 
         store_id = self._get_store_id(key)
-        
+        proxy = ServerProxy(self.store_urls[store_id], allow_none=True)
         try:
-            success = self.stores[store_id].delete(key)
+            success = proxy.delete(key)
             return success
         except Exception as e:
             logger.error(f"Error deleting from Store-{store_id}: {e}")
@@ -90,14 +98,14 @@ class Orchestrator:
     # RPC接口（供Store调用）  
     def register(self, addr, port):
         """存储节点注册服务"""
-        if len(self.stores) == self.num_stores:
+        if len(self.store_urls) == self.num_stores:
             logger.warning("Extra store is abandoned!")
             return None
         with self.stores_lock:
-            id = len(self.stores)
-            self.stores[id] = ServerProxy(f'http://{addr}:{port}', allow_none=True)
+            id = len(self.store_urls)
+            self.store_urls[id] = f'http://{addr}:{port}'
             logger.info(f"Store-{id} ready!")
-            if len(self.stores) == self.num_stores:
+            if len(self.store_urls) == self.num_stores:
                 logger.info("All stores ready!")
             return id
 
