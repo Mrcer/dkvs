@@ -4,130 +4,124 @@ from xmlrpc.server import SimpleXMLRPCServer
 from xmlrpc.client import ServerProxy
 import argparse
 import logging
+from dkvs.hash import ConsistentHash
+import time
 logger = logging.getLogger('orche')
 logging.basicConfig(level=logging.DEBUG)
 
-class Orchestrator:
-    def __init__(self, num_stores=2):
+class OrcheMain:
+    """协调节点
+    暂时只做单协调节点
+      1. 启动时有固定的地址，为 Client 和 Store 提供统一的通信地点
+      2. 通过心跳监测 Store 集群状态，在 Store 状态异常时要重新分配数据分布（采用一致性哈希）
+      3. 向 Client 返回 key 对应的 Store 地址列表（主存储 + 备份存储）
+    """
+    def __init__(self, replicas=2):
         # Store节点代理
         self.stores_lock = threading.Lock()
-        self.store_urls: dict[int, str] = {}
-        self.num_stores = num_stores
-        
-        # 所有写入都会串行化写入缓存，所以能满足面向客户端的一致性
-        self.commit_table_lock = threading.Lock()           # 提交表全局锁
-        self.commit_table: dict[str, str] = {}         # 提交表，None表示数据提交中，但不脏，否则为脏
-        self.write_queue: Queue[str] = Queue()
-        
-        # Worker线程
-        self.worker_thread = threading.Thread(target=self._writer_worker, daemon=True)
-        self.worker_thread.start()
-    
-    def _get_store_id(self, key: str):
-        """简单哈希取模"""
-        return hash(key) % self.num_stores
-    
-    def _writer_worker(self):
-        """顺序处理写入队列"""
-        while True:
-            key = self.write_queue.get()
-            store_id = self._get_store_id(key)
-            
-            try:
-                with self.commit_table_lock:
-                    if key not in self.commit_table:
-                        # 有两种可能：
-                        # 1. 队列中有多个写请求，而先前的请求已经处理了该请求的提交，因此可以跳过
-                        # 2. 在完成持久化前，数据就被删除了
-                        continue
-                    else:
-                        value = self.commit_table.pop(key)
-                proxy = ServerProxy(self.store_urls[store_id], allow_none=True)
-                success = proxy.put(key, value)
-                if not success:
-                    logger.error(f"Failed to write: key[:16]={key[:16]}")
-            except Exception as e:
-                logger.error(f"Error writing to Store-{store_id}: {e}")
-    
-    # RPC接口（供Client调用）
-    def put(self, key, value) -> bool:
-        """客户端写入：只入队，不等待"""
-        if len(self.store_urls) != self.num_stores:
-            logger.warning(f"Store not ready!")
+        self.store_info: dict[int, tuple[str, float]] = {} # store_id -> (addr, last_heartbeat)
 
-        with self.commit_table_lock:
-            self.commit_table[key] = value
-        self.write_queue.put(key)
-        
-        return True  # 已接受，异步写入
-    
-    def get(self, key) -> str:
-        """客户端读取：先查缓存，保证读到最新修改"""
-        if len(self.store_urls) != self.num_stores:
-            logger.warning(f"Store not ready!")
+        self.consistent_hash = ConsistentHash(replicas=replicas)
 
-        store_id = self._get_store_id(key)
-        proxy = ServerProxy(self.store_urls[store_id], allow_none=True)
-        with self.commit_table_lock:
-            if key in self.commit_table:
-                return self.commit_table[key]
-        try:
-            value = proxy.get(key)
-            return value    # type: ignore
-        except Exception as e:
-            logger.error(f"Error reading from Store-{store_id}: {e}")
-            return ''
-    
-    def delete(self, key):
-        """客户端删除：删除缓存和远程存储"""
-        if len(self.store_urls) != self.num_stores:
-            logger.warning(f"Store not ready!")
+        # 启动心跳检测线程
+        self.running = True
+        hb_thread = threading.Thread(target=self.task_stale_store_checker, daemon=True)
+        hb_thread.start()
 
-        success = False
-        with self.commit_table_lock:
-            if key in self.commit_table:
-                del self.commit_table[key]
-                success = True
-        store_id = self._get_store_id(key)
-        proxy = ServerProxy(self.store_urls[store_id], allow_none=True)
-        try:
-            ret = proxy.delete(key)
-            success = ret or success
-            return success
-        except Exception as e:
-            logger.error(f"Error deleting from Store-{store_id}: {e}")
-            return False
-
-    # RPC接口（供Store调用）  
-    def register(self, addr, port):
-        """存储节点注册服务"""
-        if len(self.store_urls) == self.num_stores:
-            logger.warning("Extra store is abandoned!")
-            return None
+    def add_store(self, store_id: int, addr: str):
+        """添加Store节点"""
         with self.stores_lock:
-            id = len(self.store_urls)
-            self.store_urls[id] = f'http://{addr}:{port}'
-            logger.info(f"Store-{id} ready!")
-            if len(self.store_urls) == self.num_stores:
-                logger.info("All stores ready!")
-            return id
+            self.store_info[store_id] = (addr, time.time())
+            self.consistent_hash.add_node(store_id)
+            logger.info(f"Store {store_id} added at {addr}")
 
-def run_orchestrator(num_stores=2, port=8000):
-    orchestrator = Orchestrator(num_stores)
+    def remove_store(self, store_id: int):
+        """移除Store节点"""
+        with self.stores_lock:
+            if store_id in self.store_info:
+                del self.store_info[store_id]
+                self.consistent_hash.remove_node(store_id)
+                logger.info(f"Store {store_id} removed")
+
+    def get_store_nodes(self, key: str) -> list[tuple[int, str]]:
+        """获取key对应的Store节点地址列表"""
+        store_ids = self.consistent_hash.get_nodes(key)
+        with self.stores_lock:
+            result = []
+            for store_id in store_ids:
+                if store_id in self.store_info:
+                    addr, _ = self.store_info[store_id]
+                    result.append((store_id, addr))
+            return result
+        
+    def task_stale_store_checker(self, interval=10, timeout=30):
+        """定期检查Store节点心跳，移除超时节点"""
+        while self.running:
+            time.sleep(interval)
+            now = time.time()
+            with self.stores_lock:
+                stale_stores = [store_id for store_id, (_, last_hb) in self.store_info.items() if now - last_hb > timeout]
+            for store_id in stale_stores:
+                logger.warning(f"Store {store_id} is stale, removing...")
+                # TODO: 需要重新分配数据
+                self.remove_store(store_id)
+
+class OrcheClientRPC:
+    """协调节点客户端RPC封装"""
+    def __init__(self, orche: OrcheMain):
+        self.orche = orche
     
+    def get_store_nodes(self, key: str) -> list[tuple[int, str]]:
+        """获取key对应的Store节点列表"""
+        return self.orche.get_store_nodes(key)
+    
+class OrcheStoreRPC:
+    """协调节点Store端RPC封装"""
+    def __init__(self, orche: OrcheMain):
+        self.orche = orche
+    
+    def register(self, addr: str, port: int) -> int | None:
+        """注册Store节点，返回Store ID"""
+        # TODO：分配 ID，但Store还没Ready，应当加入待命列表
+        store_id = len(self.orche.store_info) + 1
+        full_addr = f"http://{addr}:{port}"
+        self.orche.add_store(store_id, full_addr)
+        return store_id
+    
+    def ready(self, store_id: int) -> bool:
+        """Store节点完成备份拉取，正式加入集群"""
+        # TODO: 实现正式加入集群的逻辑
+        return True
+
+    def heartbeat(self, store_id: int) -> bool:
+        """心跳检测"""
+        with self.orche.stores_lock:
+            if store_id in self.orche.store_info:
+                addr, _ = self.orche.store_info[store_id]
+                self.orche.store_info[store_id] = (addr, time.time())
+                return True
+            else:
+                logger.warning(f"Unknown Store ID: {store_id}")
+                return False
+
+        
+def run_orchestrator(replicas, port=8000):
     server = SimpleXMLRPCServer(('localhost', port), allow_none=True)
-    server.register_instance(orchestrator)
+    orche = OrcheMain(replicas=replicas)
+
+    client_rpc = OrcheClientRPC(orche)
+    store_rpc = OrcheStoreRPC(orche)
     
-    logger.info(f"Started on port {port}, waiting for {num_stores} stores...")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        logger.info("Shutting down...")
+    server.register_instance(client_rpc, allow_dotted_names=True)
+    server.register_instance(store_rpc, allow_dotted_names=True)
+    
+    logger.info(f"[Orchestrator] Running on port {port}...")
+    server.serve_forever()
 
 if __name__ == '__main__':
+    # 启动协调节点
     parser = argparse.ArgumentParser()
-    parser.add_argument('--num-stores', type=int, default=2)
-    parser.add_argument('--port', type=int, default=8000)
+    parser.add_argument('--replicas', type=int, default=2, required=False)
+    parser.add_argument('--port', type=str, default=8000, required=True)
     args = parser.parse_args()
-    
-    run_orchestrator(args.num_stores, args.port)
+    run_orchestrator(replicas=args.replicas, port=args.port)
