@@ -2,10 +2,11 @@ from multiprocessing import Process
 import signal
 import dkvs
 import time
+import argparse
 
 def launch_cluster():
     procs = []
-    orche = Process(target=dkvs.run_orchestrator, args=[2, 8000], daemon=True)
+    orche = Process(target=dkvs.run_orche, args=[2, 8000], daemon=True)
     orche.start()
     time.sleep(0.2)
     procs.append(orche)
@@ -29,5 +30,11 @@ def wait_for_terminate(procs):
                 p.kill()
 
 if __name__ == '__main__':
-    procs = launch_cluster()
-    wait_for_terminate(procs)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('mode', type=str, default=f'cluster', choices=['cluster', 'cli'])
+    args = parser.parse_args()
+    if args.mode == 'cluster':
+        procs = launch_cluster()
+        wait_for_terminate(procs)
+    else:
+        dkvs.client_repl(dkvs.Client())

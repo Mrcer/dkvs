@@ -2,15 +2,19 @@ import threading
 from xmlrpc.server import SimpleXMLRPCServer
 from xmlrpc.client import ServerProxy
 import argparse
-from dkvs.hash import ConsistentHash
+from dkvs.hash import ConsistentHash, StoreInfo, StoreState
 import logging
+from uuid import UUID
+import time
+import asyncio
+import random
 logger = logging.getLogger('store')
 logging.basicConfig(level=logging.DEBUG)
 
 class StoreDB:
     """Store的实际存储数据库（每个区间一个）
     """
-    def __init__(self, db_id: int):
+    def __init__(self, db_id: UUID):
         self.db_id = db_id
         self.data = {}
         self.lock = threading.Lock()
@@ -19,7 +23,7 @@ class StoreDB:
         """存储键值对"""
         with self.lock:
             self.data[key] = value
-            logger.debug(f"[StoreDB-{self.db_id}] PUT `{key}` `{value}`")
+            logger.debug(f"[StoreDB-{str(self.db_id)[:5]}] PUT `{key}` `{value}`")
             return True
     
     def get(self, key):
@@ -27,10 +31,10 @@ class StoreDB:
         with self.lock:
             if key in self.data:
                 val = self.data[key]
-                logger.debug(f"[StoreDB-{self.db_id}] GET `{key}`, ok")
+                logger.debug(f"[StoreDB-{str(self.db_id)[:5]}] GET `{key}`, ok")
                 return val
             else:
-                logger.debug(f"[StoreDB-{self.db_id}] GET `{key}`, not found")
+                logger.debug(f"[StoreDB-{str(self.db_id)[:5]}] GET `{key}`, not found")
             return ''
     
     def delete(self, key):
@@ -38,132 +42,274 @@ class StoreDB:
         with self.lock:
             if key in self.data:
                 del self.data[key]
-                logger.debug(f"[StoreDB-{self.db_id}] DEL `{key}`, ok")
+                logger.debug(f"[StoreDB-{str(self.db_id)[:5]}] DEL `{key}`, ok")
                 return True
-            logger.debug(f"[StoreDB-{self.db_id}] DEL `{key}`, not found")
+            logger.debug(f"[StoreDB-{str(self.db_id)[:5]}] DEL `{key}`, not found")
             return False
 
     def merge(self, data: dict):
         """合并数据（用于备份恢复）"""
         with self.lock:
             self.data.update(data)
-            logger.debug(f"[StoreDB-{self.db_id}] MERGE data, size={len(data)}")
+            logger.debug(f"[StoreDB-{str(self.db_id)[:5]}] MERGE data, size={len(data)}")
             return True
 
 class StoreMain:
     """Store主类
     """
-    def __init__(self, store_id: int, replicas=2):
-        
-        # 一致性哈希，结构为：[-1, backup-R, ..., backup-1, primary]
-        self.consistent_hash = ConsistentHash(replicas=replicas)
+    def __init__(self, store_id: UUID, orche_addr: str):
+        # 一致性哈希
+        # TODO: 允许备份
+        self.store_states_lock = threading.Lock()
+        self.store_states = ConsistentHash(replicas=0)
         self.store_id = store_id
-        self.store_info: dict[int, str] = {} # store_id -> addr
 
         # 每个区间一个数据库
-        self.dbs: dict[int, StoreDB] = {}
+        self.dbs: dict[UUID, StoreDB] = {}
         self.dbs[store_id] = StoreDB(store_id)
+
+        self.orche_addr = orche_addr
+        hb_thread = threading.Thread(target=self.task_heartbeat, daemon=True)
+        hb_thread.start()
+
+        up_thread = threading.Thread(target=self.task_bringup, daemon=True)
+        up_thread.start()
+
+    def is_readable(self) -> bool:
+        """检查Store是否准备好"""
+        with self.store_states_lock:
+            store_state = self.store_states.get_node_by_id(self.store_id)
+            return (store_state.state == StoreState.READY or
+                    store_state.state == StoreState.LOCK
+                    if store_state else False)
+
+    def is_writable(self) -> bool:
+        """检查Store是否可写"""
+        with self.store_states_lock:
+            store_state = self.store_states.get_node_by_id(self.store_id)
+            return store_state.state == StoreState.READY if store_state else False
 
     def primary_put(self, key: str, value: str) -> bool:
         """主节点存储键值对，并同步到备份节点"""
-        db_id = self.consistent_hash.get_nodes(key)
-        if db_id[0] != self.store_id:
-            logger.warning(f"[Store-{self.store_id}] PUT key `{key}` to non-primary node `{db_id[0]}`")
+        if not self.is_writable():
+            logger.warning(f"[Store-{str(self.store_id)[:5]}] Not ready to serve requests")
             return False
+        # 只有主节点才能处理PUT请求
+        with self.store_states_lock:
+            nodes = self.store_states.get_nodes(key)
+            pnode = nodes[0]
+            if pnode.store_id != self.store_id:
+                logger.warning(f"[Store-{str(self.store_id)[:5]}] PUT key `{key}` to non-primary node")
+                return False
+            db = self.dbs[self.store_id]
         # local put
-        self.dbs[self.store_id].put(key, value)
+        db.put(key, value)
         # backup put
-        for backup_id in db_id[1:]:
-            with ServerProxy(self.store_info[backup_id], allow_none=True) as proxy:
-                proxy.backup_put(key, value)
+        # TODO：现在还不会发生，可能有错误
+        # for backup_id in db_id[1:]:
+        #     with ServerProxy(self.store_info[backup_id], allow_none=True) as proxy:
+        #         proxy.backup_put(key, value)
         return True
     
     def backup_put(self, key: str, value: str) -> bool:
-        """备份节点存储键值对"""
-        db_id = self.consistent_hash.get_primary_node(key)
-        if db_id == self.store_id:
-            logger.warning(f"[Store-{self.store_id}] BACKUP PUT key `{key}` to primary node `{db_id}`")
-            return False
-        if self.store_id not in self.dbs:
-                self.dbs[self.store_id] = StoreDB(self.store_id)
-        self.dbs[self.store_id].put(key, value)
+        """备份节点存储键值对
+        TODO：不应被调用
+        """
+        logging.error(f"[Store-{str(self.store_id)[:5]}] Not implemented: backup_put called")
+        # db_id = self.consistent_hash.get_primary_node(key)
+        # if db_id == self.store_id:
+        #     logger.warning(f"[Store-{str(self.store_id)[:5]}] BACKUP PUT key `{key}` to primary node `{db_id}`")
+        #     return False
+        # if self.store_id not in self.dbs:
+        #         self.dbs[self.store_id] = StoreDB(self.store_id)
+        # self.dbs[self.store_id].put(key, value)
         return True
     
     def get(self, key: str) -> str | None:
         """从本地存储获取值，包括主存储和备份存储"""
-        db_id = self.consistent_hash.get_primary_node(key)
-        if db_id not in self.dbs:
-            logger.warning(f"[Store-{self.store_id}] GET key `{key}` from non-local node `{db_id}`")
+        if not self.is_readable():
+            logger.warning(f"[Store-{str(self.store_id)[:5]}] Not ready to serve requests")
             return None
-        return self.dbs[db_id].get(key)
+        # 从任意StoreDB获取值
+        with self.store_states_lock:
+            pstore = self.store_states.get_primary_node(key)
+            if pstore is None:
+                logger.warning(f"[Store-{str(self.store_id)[:5]}] GET key `{key}` but no Store nodes")
+                return None
+            db_id = pstore.store_id
+            if db_id not in self.dbs:
+                logger.warning(f"[Store-{str(self.store_id)[:5]}] GET key `{key}` from non-local node")
+                return None
+            db = self.dbs[db_id]
+        return db.get(key)
+    
+    def get_range_data(self, hash_from: int, hash_to: int) -> dict | None:
+        """获取指定区间的数据"""
+        if self.store_id not in self.dbs:
+            logger.warning(f"[Store-{str(self.store_id)[:5]}] GET RANGE DATA but no local DB")
+            return None
+        db = self.dbs[self.store_id]
+        result = {}
+        with db.lock:
+            for key, value in db.data.items():
+                h = self.store_states._hash(key)
+                if hash_from < hash_to:
+                    if hash_from <= h < hash_to:
+                        result[key] = value
+                else:
+                    # 环形区间
+                    if h >= hash_from or h < hash_to:
+                        result[key] = value
+        logger.info(f"[Store-{str(self.store_id)[:5]}] GET RANGE DATA from {hash_from} to {hash_to}, size={len(result)}")
+        return result
 
     def primary_delete(self, key: str) -> bool:
         """主节点删除键值对，并同步到备份节点"""
-        db_id = self.consistent_hash.get_nodes(key)
-        if db_id[0] != self.store_id:
-            logger.warning(f"[Store-{self.store_id}] DEL key `{key}` to non-primary node `{db_id[0]}`")
+        if not self.is_writable():
+            logger.warning(f"[Store-{str(self.store_id)[:5]}] Not ready to serve requests")
             return False
+        # 只有主节点才能处理DELETE请求
+        with self.store_states_lock:
+            nodes = self.store_states.get_nodes(key)
+            pnode = nodes[0]
+            if pnode.store_id != self.store_id:
+                logger.warning(f"[Store-{str(self.store_id)[:5]}] DEL key `{key}` to non-primary node")
+                return False
+            db = self.dbs[self.store_id]
         # local delete
-        self.dbs[self.store_id].delete(key)
+        db.delete(key)
         # backup delete
-        for backup_id in db_id[1:]:
-            with ServerProxy(self.store_info[backup_id], allow_none=True) as proxy:
-                proxy.backup_delete(key)
+        # TODO：现在还不会发生，可能有错误
+        # for backup_id in db_id[1:]:
+        #     with ServerProxy(self.store_info[backup_id], allow_none=True) as proxy:
+        #         proxy.backup_delete(key)
         return True
     
     def backup_delete(self, key: str) -> bool:
-        """备份节点删除键值对"""
-        db_id = self.consistent_hash.get_primary_node(key)
-        if db_id == self.store_id:
-            logger.warning(f"[Store-{self.store_id}] BACKUP DEL key `{key}` to primary node `{db_id}`")
-            return False
-        if self.store_id not in self.dbs:
-            logger.warning(f"[Store-{self.store_id}] BACKUP DEL key `{key}` but no local DB")
-            return False
-        self.dbs[self.store_id].delete(key)
+        """备份节点删除键值对
+        TODO：不应被调用
+        """
+        logging.error(f"[Store-{str(self.store_id)[:5]}] Not implemented: backup_delete called")
+        # db_id = self.consistent_hash.get_primary_node(key)
+        # if db_id == self.store_id:
+        #     logger.warning(f"[Store-{str(self.store_id)[:5]}] BACKUP DEL key `{key}` to primary node `{db_id}`")
+        #     return False
+        # if self.store_id not in self.dbs:
+        #     logger.warning(f"[Store-{str(self.store_id)[:5]}] BACKUP DEL key `{key}` but no local DB")
+        #     return False
+        # self.dbs[self.store_id].delete(key)
         return True
     
-    def backup_recover(self, data: dict) -> bool:
-        """备份恢复数据"""
-        if self.store_id not in self.dbs:
-            self.dbs[self.store_id] = StoreDB(self.store_id)
-        self.dbs[self.store_id].merge(data)
-        return True
+    def task_heartbeat(self, interval=10):
+        """定期发送心跳到协调节点"""
+        while True:
+            time.sleep(interval)
+            with ServerProxy(self.orche_addr, allow_none=True) as proxy:
+                proxy.heartbeat(str(self.store_id))
+
+    def task_bringup(self):
+        store_up = False
+        while not store_up:
+            time.sleep(random.random() * 2)     # 随机休眠一段时间重试
+            store_up = self.bringup_store()
+        self.update_ring()
+
+    def update_ring(self):
+        """主动更新哈希环"""
+        with self.store_states_lock:
+            logger.debug(f"[Store-{str(self.store_id)[:5]}] Force ring update")
+            with ServerProxy(self.orche_addr, allow_none=True) as proxy:
+                ring: list[StoreInfo] = list(map(StoreInfo.from_dict, proxy.get_ring())) # type: ignore
+                self.store_states.reset_ring(ring)
+
+    async def shrink_store(self):
+        """清除不在哈希环内的数据"""
+        logger.info(f"[Store-{str(self.store_id)[:5]}] Shrinking store data not in ring")
+        with self.store_states_lock:
+            # 计算本节点负责的区间
+            prev_node, next_node = self.store_states.get_node_pair_in_state(
+                str(self.store_id), lambda info: info.state is not StoreState.INITIALIZING
+            ) or (None, None)
+            if not prev_node or not next_node:
+                logger.warning(f"[Store-{str(self.store_id)[:5]}] Cannot shrink store, no valid ring")
+                return
+            hash_from = self.store_states._hash(str(prev_node.store_id))
+            hash_to = self.store_states._hash(str(self.store_id))
+            # 清理数据
+            if self.store_id not in self.dbs:
+                logger.info(f"[Store-{str(self.store_id)[:5]}] No local DB to shrink")
+                return
+            db = self.dbs[self.store_id]
+            with db.lock:
+                keys_to_delete = []
+                for key in db.data.keys():
+                    h = self.store_states._hash(key)
+                    if hash_from < hash_to:
+                        if not (hash_from <= h < hash_to):
+                            keys_to_delete.append(key)
+                    else:
+                        # 环形区间
+                        if not (h >= hash_from or h < hash_to):
+                            keys_to_delete.append(key)
+                for key in keys_to_delete:
+                    db.delete(key)
+                logger.info(f"[Store-{str(self.store_id)[:5]}] Shrunk store data, deleted {len(keys_to_delete)} keys")
+
+    def bringup_store(self) -> bool:
+        """异步初始化Store节点为ready状态，尝试拉取备份数据"""
+        logger.debug(f"[Store-{str(self.store_id)[:5]}] Tring to bring up")
+        self.update_ring()
+        # TODO：锁优化
+        with self.store_states_lock:
+            prev_node, next_node = self.store_states.get_node_pair_in_state(
+                str(self.store_id), lambda info: info.state is not StoreState.INITIALIZING
+            ) or (None, None)
+            if not prev_node or not next_node:
+                # 没有主节点，直接设置为ready
+                with ServerProxy(self.orche_addr, allow_none=True) as proxy:
+                    proxy.set_store_state(str(self.store_id), StoreState.READY.value) # type: ignore
+                logger.info(f"[Store-{str(self.store_id)[:5]}] No backup store, set to READY")
+                return True
+            # 拉取备份数据
+            logger.info(f"[Store-{str(self.store_id)[:5]}] Fetching backup data from {str(next_node.store_id)[:5]}")
+            with ServerProxy(next_node.addr, allow_none=True) as proxy:
+                # 目前仅拉取主存储区间的数据
+                data: dict | None = proxy.fetch_range_data(
+                    hex(self.store_states._hash(str(prev_node.store_id))),
+                    hex(self.store_states._hash(str(self.store_id)))
+                ) # type: ignore
+            if data is not None:
+                logger.info(f"[Store-{str(self.store_id)[:5]}] Merging backup data, size={len(data)}")
+                if self.store_id not in self.dbs:
+                    self.dbs[self.store_id] = StoreDB(self.store_id)
+                self.dbs[self.store_id].merge(data)
+            else:
+                logger.warning(f"[Store-{str(self.store_id)[:5]}] Backup data fetch failed from {str(next_node.store_id)[:5]}")
+                return False
+            # 初始化成功，设置为ready
+            with ServerProxy(self.orche_addr, allow_none=True) as proxy:
+                proxy.set_store_state(str(self.store_id), StoreState.READY.value) # type: ignore
+            # 通知旧主节点主从切换
+            with ServerProxy(next_node.addr, allow_none=True) as proxy:
+                proxy.fetch_range_data_callback(str(self.store_id)) # type: ignore
+            return True
     
-class StoreClientRPC:
-    """Store客户端RPC封装"""
+class StoreRPC:
+    """StoreRPC封装"""
     def __init__(self, store: StoreMain):
         self.store = store
 
-    def put(self, key: str, value: str) -> bool:
+    def client_put(self, key: str, value: str) -> bool:
         """存储键值对"""
         return self.store.primary_put(key, value)
 
-    def get(self, key: str) -> str:
+    def client_get(self, key: str) -> str | None:
         """获取值"""
-        return self.store.get(key) or ''
+        return self.store.get(key)
 
-    def delete(self, key: str) -> bool:
+    def client_delete(self, key: str) -> bool:
         """删除键值对"""
         return self.store.primary_delete(key)
-    
-class StoreOrcheRPC:
-    """Store协调节点RPC封装"""
-    def __init__(self, store: StoreMain):
-        self.store = store
-
-    def update_ring(self, nodes: list[tuple[int, str]]) -> bool:
-        """异步更新数据库信息"""
-        logger.info(f"[Store-{self.store.store_id}] update_ring called with nodes: {nodes}")
-        for store_id, addr in nodes:
-            self.store.store_info[store_id] = addr
-        self.store.consistent_hash.reset_ring([store_id for store_id, _ in nodes])
-        return True
-
-class StoreStoreRPC:
-    """Store间RPC封装"""
-    def __init__(self, store: StoreMain):
-        self.store = store
 
     def backup_put(self, key: str, value: str) -> bool:
         """备份节点存储键值对"""
@@ -173,23 +319,51 @@ class StoreStoreRPC:
         """备份节点删除键值对"""
         return self.store.backup_delete(key)
 
-    def fetch_range_data(self, hash_from: int, hash_to: int) -> dict:
-        """获取指定区间的数据（用于备份恢复）"""
-        result = {}
-        for db in self.store.dbs.values():
-            with db.lock:
-                for key, value in db.data.items():
-                    h = self.store.consistent_hash._hash(key)
-                    if hash_from <= h < hash_to:
-                        result[key] = value
-        logger.debug(f"[Store-{self.store.store_id}] fetch_range_data from {hash_from} to {hash_to}, size={len(result)}")
-        return result
+    def fetch_range_data(self, _hash_from: str, _hash_to: str) -> dict | None:
+        """获取指定区间的数据
+        会导致此节点不可写，直到主从切换完成
+        如果数据不在本节点存储区间内，返回 None
+        TODO：处理异常情况
+        """
+        hash_from = int(_hash_from, 16)
+        hash_to = int(_hash_to, 16)
+        # 检查区间是否在本节点负责范围内
+        logger.info(f"[Store-{str(self.store.store_id)[:5]}] Backup data fetching from {_hash_from} to {_hash_to}")
+        with self.store.store_states_lock:
+            store_states = self.store.store_states
+            is_from_in_range = store_states.is_in_range(hash_from, self.store.store_id)
+            is_to_in_range = store_states.is_in_range(hash_to, self.store.store_id)
+            if not (is_from_in_range and is_to_in_range):
+                logger.warning(f"[Store-{str(self.store.store_id)[:5]}] Fetch out of range")
+                return None
+        # 为节点区间上锁
+        if self.store.is_writable():
+            with ServerProxy(self.store.orche_addr, allow_none=True) as proxy:
+                proxy.set_store_state(str(self.store.store_id), StoreState.LOCK.value)  # type: ignore
+            self.store.update_ring()    # 立即让本节点不可写
+            logger.info(f"[Store-{str(self.store.store_id)[:5]}] Store locked")
+        else:
+            logger.warning(f"[Store-{str(self.store.store_id)[:5]}] Store is not writable, fetch failed")
+            return None
+        # 获取数据
+        data = self.store.get_range_data(hash_from, hash_to)
+        return data
+    
+    def fetch_range_data_callback(self, node_id: str) -> bool:
+        """备份数据回调接口
+        当新节点完成数据拉取且ready后调用此接口以完成主从切换
+        """
+        logger.info(f"[Store-{str(self.store.store_id)[:5]}] fetch_range_data_callback called from {node_id[:5]}")
+        # 同步完成，设置为ready
+        with ServerProxy(self.store.orche_addr, allow_none=True) as proxy:
+            proxy.set_store_state(str(self.store.store_id), StoreState.READY.value)  # type: ignore
+        self.store.update_ring()
+        logger.info(f"[Store-{str(self.store.store_id)[:5]}] Backup Synced, store unlocked")
+        # 异步清理数据
+        asyncio.run(self.store.shrink_store())
+        return True
 
-def register(orche_dest, store_addr, store_port):
-    orche = ServerProxy(orche_dest, allow_none=True)
-    return orche.register(store_addr, store_port)
-
-def start_server(port_range: range) -> tuple[SimpleXMLRPCServer, int] | None:
+def start_rpc_on_random_port(port_range: range) -> tuple[SimpleXMLRPCServer, int] | None:
     for port in port_range:
         try:
             server = SimpleXMLRPCServer(('localhost', port), allow_none=True)
@@ -198,25 +372,28 @@ def start_server(port_range: range) -> tuple[SimpleXMLRPCServer, int] | None:
         else:
             return server, port
     return None
-    
 
 def run_store(orche_dest, port_range=range(10000, 20000)):
-    res = start_server(port_range)
+    # 启动 RPC 服务器
+    res = start_rpc_on_random_port(port_range)
     if not res:
-        logger.info("[Store] No available port, exiting...")
+        logger.info("No available port, exiting...")
         return
     server, port = res
-    store_id = register(orche_dest, 'localhost', port)
+    # 注册到协调节点同时启动 Store 实例
+    orche = ServerProxy(orche_dest, allow_none=True)
+    store_id: str | None = orche.register('localhost', port) # type: ignore
     if store_id is None:
-        logger.info("[Store] register failed.")
+        logger.info("register failed.")
         return
-    store = Store(store_id)
-    server.register_instance(store)
-    logger.info(f"Store-{store_id} started on port {port}")
+    store = StoreMain(UUID(store_id), orche_dest)
+    rpc = StoreRPC(store)
+    server.register_instance(rpc)
+    logger.info(f"Store-{store_id[:5]} started on port {port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        logger.info(f"Store-{store_id} shutting down...")
+        logger.info(f"Store-{store_id[:5]} shutting down...")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()

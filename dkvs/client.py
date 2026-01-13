@@ -1,19 +1,49 @@
 from xmlrpc.client import ServerProxy
+from dkvs.hash import ConsistentHash, StoreInfo
 import argparse
+import logging
+logger = logging.getLogger('client')
+logging.basicConfig(level=logging.DEBUG)
 
 class Client:
-    def __init__(self, orchestrator_port=8000):
-        self.orchestrator = ServerProxy(f'http://localhost:{orchestrator_port}', allow_none=True)
+    def __init__(self, orche_port=8000):
+        self.orche_addr = f'http://localhost:{orche_port}'
+        self.store_states = ConsistentHash(replicas=0)
+        self.update_ring()
+    
+    def update_ring(self):
+        logger.info("Updating ring")
+        with ServerProxy(self.orche_addr, allow_none=True) as proxy:
+            store_infos: list[StoreInfo] = list(map(StoreInfo.from_dict, proxy.get_ring()))  # type: ignore
+            self.store_states.reset_ring(store_infos)
     
     def put(self, key: str, value: str) -> bool:
-        return self.orchestrator.put(key, value)    # type: ignore
-    
-    def get(self, key: str) -> str:
-        return self.orchestrator.get(key)           # type: ignore
-    
+        self.update_ring()
+        store_info = self.store_states.get_primary_node(key)
+        if not store_info:
+            logger.error("No available Store for key")
+            return False
+        with ServerProxy(store_info.addr, allow_none=True) as proxy:
+            return proxy.client_put(key, value)    # type: ignore
+
+    def get(self, key: str) -> str | None:
+        self.update_ring()
+        store_info = self.store_states.get_primary_node(key)
+        if not store_info:
+            logger.error("No available Store for key")
+            return None
+        with ServerProxy(store_info.addr, allow_none=True) as proxy:
+            return proxy.client_get(key)           # type: ignore
+
     def delete(self, key: str) -> bool:
-        return self.orchestrator.delete(key)  # type: ignore
-    
+        self.update_ring()
+        store_info = self.store_states.get_primary_node(key)
+        if not store_info:
+            logger.error("No available Store for key")
+            return False
+        with ServerProxy(store_info.addr, allow_none=True) as proxy:
+            return proxy.client_delete(key)        # type: ignore
+
 def client_repl(client):
     """交互式命令行"""
     print("=== KV Store Client ===")
