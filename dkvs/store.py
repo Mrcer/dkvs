@@ -9,9 +9,27 @@ import time
 import asyncio
 import random
 from typing import Literal
+from dataclasses import dataclass
 
 logger = logging.getLogger("store")
 logging.basicConfig(level=logging.DEBUG)
+
+
+@dataclass
+class StoreData:
+    value: str
+    version: int
+
+    def set(self, val: str):
+        self.version += 1
+        self.value = val
+
+    def to_dict(self):
+        return {"value": self.value, "version": self.version}
+
+    @classmethod
+    def from_dict(cls, d: dict):
+        return StoreData(d["value"], d["version"])
 
 
 class StoreDB:
@@ -19,28 +37,49 @@ class StoreDB:
 
     def __init__(self, db_id: UUID):
         self.db_id = db_id
-        self.data = {}
+        self.data: dict[str, StoreData] = {}
         self.lock = threading.Lock()
 
-    def put(self, key, value):
+    def put(self, key: str, value: str) -> tuple[bool, int]:
         """存储键值对"""
         with self.lock:
-            self.data[key] = value
-            logger.debug(f"[StoreDB-{str(self.db_id)[:5]}] PUT `{key}` `{value}`")
-            return True
+            if key not in self.data:
+                self.data[key] = StoreData("", 0)
+            item = self.data[key]
+            item.set(value)
+            logger.debug(
+                f"[StoreDB-{str(self.db_id)[:5]}] PUT `{key}` `{value}`, version={item.version}"
+            )
+            return True, item.version
 
-    def get(self, key) -> str | None:
+    def is_up_to_date(self, key: str, version: int) -> bool:
+        with self.lock:
+            if key not in self.data:
+                return False
+            db_v = self.data[key].version
+        if db_v < version:
+            # 当前一致性的数据库不应出现这种情况
+            logger.warning(
+                f"[StoreDB-{str(self.db_id)[:5]}] Client version of {key}({version}) is newer than db version({db_v})"
+            )
+            return True
+        elif db_v == version:
+            return True
+        else:
+            return False
+
+    def get(self, key) -> tuple[str, int] | None:
         """获取值"""
         with self.lock:
             if key in self.data:
-                val = self.data[key]
+                item = self.data[key]
                 logger.debug(f"[StoreDB-{str(self.db_id)[:5]}] GET `{key}`, ok")
-                return val
+                return item.value, item.version
             else:
                 logger.debug(f"[StoreDB-{str(self.db_id)[:5]}] GET `{key}`, not found")
             return None
 
-    def delete(self, key):
+    def delete(self, key) -> bool:
         """删除键值对"""
         with self.lock:
             if key in self.data:
@@ -50,10 +89,17 @@ class StoreDB:
             logger.debug(f"[StoreDB-{str(self.db_id)[:5]}] DEL `{key}`, not found")
             return False
 
-    def merge(self, data: dict):
+    def merge(self, data: dict[str, StoreData]):
         """合并数据（用于备份恢复）"""
         with self.lock:
-            self.data.update(data)
+            for k, v in data.items():
+                if k in self.data:
+                    # TODO：当前系统不应出现这种情况，未定义行为
+                    logger.warning(
+                        f"[StoreDB-{str(self.db_id)[:5]}] Conflict key in MERGE data, do nothing"
+                    )
+                else:
+                    self.data[k] = v
             logger.debug(
                 f"[StoreDB-{str(self.db_id)[:5]}] MERGE data, size={len(data)}"
             )
@@ -97,7 +143,7 @@ class StoreMain:
         store_state = self.store_states.get_node_by_id(self.store_id)
         return store_state.state == StoreState.READY if store_state else False
 
-    def primary_put(self, key: str, value: str) -> bool:
+    def primary_put(self, key: str, value: str) -> tuple[bool, int]:
         """主节点存储键值对，并同步到备份节点"""
         # 只有主节点才能处理PUT请求
         with self.store_states_lock:
@@ -105,23 +151,23 @@ class StoreMain:
                 logger.warning(
                     f"[Store-{str(self.store_id)[:5]}] Not ready to serve requests"
                 )
-                return False
+                return False, 0
             nodes = self.store_states.get_nodes(key)
             pnode = nodes[0]
             if pnode.store_id != self.store_id:
                 logger.warning(
                     f"[Store-{str(self.store_id)[:5]}] PUT key `{key}` to non-primary node"
                 )
-                return False
+                return False, 0
             db = self.dbs[self.store_id]
         # local put
-        db.put(key, value)
+        ret = db.put(key, value)
         # backup put
         # TODO：现在还不会发生，可能有错误
         # for backup_id in db_id[1:]:
         #     with ServerProxy(self.store_info[backup_id], allow_none=True) as proxy:
         #         proxy.backup_put(key, value)
-        return True
+        return ret
 
     def backup_put(self, key: str, value: str) -> bool:
         """备份节点存储键值对
@@ -139,9 +185,33 @@ class StoreMain:
         # self.dbs[self.store_id].put(key, value)
         return True
 
-    def get(
-        self, key: str
-    ) -> tuple[Literal["NOT_FOUND", "WRONG_NODE", "SUCCESS", "TEMPORARY_ERROR"], str]:
+    def is_up_to_date(self, key: str, version: int) -> bool:
+        with self.store_states_lock:
+            if not self.is_readable():
+                logger.warning(
+                    f"[Store-{str(self.store_id)[:5]}] Not ready to serve requests"
+                )
+                return False
+            pstore = self.store_states.get_primary_node(key)
+            if pstore is None:
+                logger.warning(
+                    f"[Store-{str(self.store_id)[:5]}] GET key `{key}` but no Store nodes"
+                )
+                return False
+            db_id = pstore.store_id
+            if db_id not in self.dbs:
+                logger.warning(
+                    f"[Store-{str(self.store_id)[:5]}] GET key `{key}` from non-local node"
+                )
+                return False
+            db = self.dbs[db_id]
+        return db.is_up_to_date(key, version)
+
+    def get(self, key: str, version: int) -> tuple[
+        Literal["NOT_FOUND", "WRONG_NODE", "SUCCESS", "TEMPORARY_ERROR", "UP_TO_DATE"],
+        str,
+        int,
+    ]:
         """从本地存储获取值，包括主存储和备份存储"""
         # 从任意StoreDB获取值
         with self.store_states_lock:
@@ -149,27 +219,32 @@ class StoreMain:
                 logger.warning(
                     f"[Store-{str(self.store_id)[:5]}] Not ready to serve requests"
                 )
-                return "TEMPORARY_ERROR", ""
+                return "TEMPORARY_ERROR", "", 0
             pstore = self.store_states.get_primary_node(key)
             if pstore is None:
                 logger.warning(
                     f"[Store-{str(self.store_id)[:5]}] GET key `{key}` but no Store nodes"
                 )
-                return "TEMPORARY_ERROR", ""
+                return "TEMPORARY_ERROR", "", 0
             db_id = pstore.store_id
             if db_id not in self.dbs:
                 logger.warning(
                     f"[Store-{str(self.store_id)[:5]}] GET key `{key}` from non-local node"
                 )
-                return "WRONG_NODE", ""
+                return "WRONG_NODE", "", 0
             db = self.dbs[db_id]
+        if db.is_up_to_date(key, version):
+            logger.info(f"[Store-{str(self.store_id)[:5]}] GET key `{key}` and it's up to date")
+            return "UP_TO_DATE", "", version
         v = db.get(key)
         if v:
-            return "SUCCESS", v
+            return "SUCCESS", v[0], v[1]
         else:
-            return "NOT_FOUND", ""
+            return "NOT_FOUND", "", 0
 
-    def get_range_data(self, hash_from: int, hash_to: int) -> dict | None:
+    def get_range_data(
+        self, hash_from: int, hash_to: int
+    ) -> dict[str, StoreData] | None:
         """获取指定区间的数据"""
         if self.store_id not in self.dbs:
             logger.warning(
@@ -286,7 +361,7 @@ class StoreMain:
             hash_to = self.store_states._hash(str(self.store_id))
             # 清理数据
             if self.store_id not in self.dbs:
-                logger.info(f"[Store-{str(self.store_id)[:5]}] No local DB to shrink")
+                logger.error(f"[Store-{str(self.store_id)[:5]}] No local DB to shrink")
                 return
             db = self.dbs[self.store_id]
             keys_to_delete = []
@@ -333,7 +408,7 @@ class StoreMain:
             )
             with ServerProxy(next_node.addr, allow_none=True) as proxy:
                 # 目前仅拉取主存储区间的数据
-                data: dict | None = proxy.fetch_range_data(
+                data: dict[str, dict] | None = proxy.fetch_range_data(
                     hex(self.store_states._hash(str(prev_node.store_id))),
                     hex(self.store_states._hash(str(self.store_id))),
                 )  # type: ignore
@@ -343,7 +418,9 @@ class StoreMain:
                 )
                 if self.store_id not in self.dbs:
                     self.dbs[self.store_id] = StoreDB(self.store_id)
-                self.dbs[self.store_id].merge(data)
+                self.dbs[self.store_id].merge(
+                    {k: StoreData.from_dict(v) for k, v in data.items()}
+                )
             else:
                 logger.warning(
                     f"[Store-{str(self.store_id)[:5]}] Backup data fetch failed from {str(next_node.store_id)[:5]}"
@@ -364,15 +441,17 @@ class StoreRPC:
     def __init__(self, store: StoreMain):
         self.store = store
 
-    def client_put(self, key: str, value: str) -> bool:
+    def client_put(self, key: str, value: str) -> tuple[bool, int]:
         """存储键值对"""
         return self.store.primary_put(key, value)
 
-    def client_get(
-        self, key: str
-    ) -> tuple[Literal["NOT_FOUND", "WRONG_NODE", "SUCCESS", "TEMPORARY_ERROR"], str]:
+    def client_get(self, key: str, version: int) -> tuple[
+        Literal["NOT_FOUND", "WRONG_NODE", "SUCCESS", "TEMPORARY_ERROR", "UP_TO_DATE"],
+        str,
+        int,
+    ]:
         """获取值"""
-        return self.store.get(key)
+        return self.store.get(key, version)
 
     def client_delete(self, key: str) -> bool:
         """删除键值对"""
@@ -391,6 +470,7 @@ class StoreRPC:
         会导致此节点不可写，直到主从切换完成
         如果数据不在本节点存储区间内，返回 None
         TODO：处理异常情况
+        TODO：这些内容应该放在Main
         """
         hash_from = int(_hash_from, 16)
         hash_to = int(_hash_to, 16)
@@ -424,11 +504,15 @@ class StoreRPC:
         logger.info(f"[Store-{str(self.store.store_id)[:5]}] Store locked")
         # 获取数据
         data = self.store.get_range_data(hash_from, hash_to)
-        return data
+        if data is None:
+            return None
+        else:
+            return {k: v.to_dict() for k, v in data.items()}
 
     def fetch_range_data_callback(self, node_id: str) -> bool:
         """备份数据回调接口
         当新节点完成数据拉取且ready后调用此接口以完成主从切换
+        TODO：这些内容应该放在Main
         """
         logger.info(
             f"[Store-{str(self.store.store_id)[:5]}] fetch_range_data_callback called from {node_id[:5]}"

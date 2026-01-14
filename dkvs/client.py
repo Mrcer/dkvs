@@ -8,11 +8,51 @@ from typing import Literal
 logger = logging.getLogger("client")
 logging.basicConfig(level=logging.DEBUG)
 
+class LRUCache:
+
+    def __init__(self, max_size=128):
+        self.max_size = max_size
+        self.seq = 0
+        self.hit_count = 0
+        self.access_count = 0
+        self.db: dict[str, tuple[str, int, int]] = {}   # key -> val, version, access_count
+
+    def __contains__(self, k):
+        return k in self.db
+    
+    def __getitem__(self, key: str) -> tuple[str, int]:
+        self.access_count += 1
+        if key in self.db:
+            self.hit_count += 1
+            item = self.db[key]
+            self.db[key] = (item[0], item[1], self.access_count)
+            return item[0], item[1]
+        else:
+            raise KeyError
+
+    def shrink(self):
+        all_items = list(self.db.items())
+        all_items.sort(key=lambda x: x[1][1], reverse=True)
+        old_items = all_items[self.max_size + 1:]
+        for i, _ in old_items:
+            del self.db[i]
+
+    def update(self, key: str, val: str, version: int):
+        if key not in self.db:
+            self.db[key] = (val, version, 0)
+        self.db[key] = (val, version, self.access_count)
+        if len(self.db) > self.max_size * 1.5:
+            self.shrink()
+
+    def delete(self, key: str):
+        if key in self.db:
+            del self.db[key]
 
 class Client:
     def __init__(self, orche_port=8000):
         self.orche_addr = f"http://localhost:{orche_port}"
         self.store_states = ConsistentHash(replicas=0)
+        self.cache = LRUCache()
         self.update_ring()
 
     def update_ring(self):
@@ -30,8 +70,10 @@ class Client:
                 logger.error("No available Store for key")
                 return False
             with ServerProxy(store_info.addr, allow_none=True) as proxy:
-                ret = proxy.client_put(key, value)  # type: ignore
-            if ret:
+                ret: tuple[bool, int] = proxy.client_put(key, value)  # type: ignore
+            if ret[0]:
+                _, version = ret
+                self.cache.update(key, value, version)
                 return True
             else:
                 logger.warning("Put failed, retring in 1 sec")
@@ -47,12 +89,20 @@ class Client:
             if not store_info:
                 logger.error("No available Store for key")
                 continue
+            if key in self.cache:
+                cached_val, cache_version = self.cache[key]
+            else:
+                cached_val, cache_version = '', 0
             with ServerProxy(store_info.addr, allow_none=True) as proxy:
-                ret: Literal["NOT_FOUND", "WRONG_NODE", "SUCCESS", "TEMPORARY_ERROR"] = proxy.client_get(key)  # type: ignore
-                status, val = ret
-            if status == "SUCCESS":
-                return val
+                ret: tuple[Literal["NOT_FOUND", "WRONG_NODE", "SUCCESS", "TEMPORARY_ERROR", "UP_TO_DATE"], str, int] = proxy.client_get(key, cache_version)  # type: ignore
+                status, get_val, version = ret
+            if status == "UP_TO_DATE":
+                return cached_val
+            elif status == "SUCCESS":
+                self.cache.update(key, get_val, version)
+                return get_val
             elif status == "NOT_FOUND":
+                self.cache.delete(key)
                 return None
             else:
                 logger.warning("Put failed, retring in 1 sec")
@@ -70,9 +120,10 @@ class Client:
             with ServerProxy(store_info.addr, allow_none=True) as proxy:
                 ret = proxy.client_delete(key)  # type: ignore
             if ret:
+                self.cache.delete(key)
                 return True
             else:
-                logger.warning("Put failed, retring in 1 sec")
+                logger.warning("Delete failed, retring in 1 sec")
                 time.sleep(1)
         return False
 

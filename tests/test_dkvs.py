@@ -464,6 +464,7 @@ class TestIntegration(unittest.TestCase):
             n = len(sim_db)
         del_items = random.sample(list(sim_db.items()), k=n)
         for k, v in del_items:
+            print(f'deleting {k}')
             ret = client.get(k)
             self.assertEqual(ret, v)
             del sim_db[k]
