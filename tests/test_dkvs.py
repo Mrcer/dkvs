@@ -1,13 +1,14 @@
 # tests/test_dkvs.py
 import unittest
-import threading
 import time
-import xmlrpc.server
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 from uuid import uuid4, UUID
-from xmlrpc.client import ServerProxy
+import dkvs
+from multiprocessing import Process
+import threading
+import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from dkvs import hash, orche, store
 from dkvs.hash import ConsistentHash, StoreInfo, StoreState
 
 class TestConsistentHashLogic(unittest.TestCase):
@@ -420,17 +421,17 @@ class TestIntegration(unittest.TestCase):
     """轻量级集成测试"""
 
     def setUp(self):
-        import dkvs
-        from multiprocessing import Process
         self.stores = []
         self.orche = Process(target=dkvs.run_orche, args=[2, 8000], daemon=True)
         self.orche.start()
-        for i in range(2):
-            store = Process(target=dkvs.run_store, args=['http://localhost:8000/'], daemon=True)
-            store.start()
-            self.stores.append(store)
+        for _ in range(3):
+            self.add_store()
         time.sleep(3)
-        self.client = dkvs.Client(8000)
+
+    def add_store(self):
+        store = Process(target=dkvs.run_store, args=['http://localhost:8000/'], daemon=True)
+        store.start()
+        self.stores.append(store)
 
     @staticmethod
     def terminate_proc(p):
@@ -446,12 +447,204 @@ class TestIntegration(unittest.TestCase):
         for s in self.stores:
             self.terminate_proc(s)
 
-    def test_end_to_end(self):
-        self.assertTrue(self.client.put("integrate", "test"))
-        self.assertEqual(self.client.get("integrate"), "test")
-        self.assertTrue(self.client.delete("integrate"))
-        self.assertEqual(self.client.get("integrate"), "")
+    def append_data(self, client: dkvs.Client, sim_db: dict, n=100):
+        for _ in range(n):
+            k, v = str(uuid4()), str(uuid4())
+            sim_db[k] = v
+            ret = client.put(k, v)
+            self.assertTrue(ret)
+            ret = client.get(k)
+            self.assertEqual(ret, v)
 
+    def del_random_data(self, client: dkvs.Client, sim_db: dict, n=50):
+        if n > len(sim_db):
+            n = len(sim_db)
+        del_items = random.sample(list(sim_db.items()), k=n)
+        for k, v in del_items:
+            ret = client.get(k)
+            self.assertEqual(ret, v)
+            del sim_db[k]
+            ret = client.delete(k)
+            self.assertTrue(ret)
+            ret = client.get(k)
+            self.assertIsNone(ret)
+
+    def check_integrity(self, client: dkvs.Client, sim_db: dict, sample_k=None):
+        if sample_k:
+            sample_k = sample_k if sample_k <= len(sim_db) else len(sim_db)
+            items = random.sample(list(sim_db.items()), k=sample_k)
+        else:
+            items = sim_db.items()
+        for k, v in items:
+            ret = client.get(k)
+            self.assertEqual(ret, v)
+
+    def test_appand(self):
+        client = dkvs.Client()
+        self.append_data(client, {})
+
+    def test_appand_and_del(self):
+        client = dkvs.Client()
+        db = {}
+        self.append_data(client, db)
+        self.del_random_data(client, db)
+        self.check_integrity(client, db)
+
+    def test_scale(self):
+        client = dkvs.Client()
+        db = {}
+        self.append_data(client, db)
+        self.add_store()
+        time.sleep(3)
+        self.append_data(client, db)
+        self.del_random_data(client, db)
+        self.check_integrity(client, db)
+
+    def test_stream10s_integrity(self):
+        running = threading.Event()
+        fail = threading.Event()
+        running.set()
+
+        def stream():
+            client = dkvs.Client()
+            try:
+                db = {}
+                self.append_data(client, db)
+                while running.is_set():
+                    op = random.choice(['put', 'get', 'del'])
+                    if op == 'put':
+                        self.append_data(client, db, n=1)
+                    if op == 'get':
+                        self.check_integrity(client, db, sample_k=1)
+                    if op == 'del':
+                        self.del_random_data(client, db, n=1)
+            except:
+                fail.set()
+                raise
+        
+        t = threading.Thread(target=stream)
+        t.start()
+        
+        time.sleep(10)
+        
+        running.clear()
+        t.join()
+        self.assertFalse(fail.is_set())
+
+    def test_2streams10s_integrity(self):
+        USER_N      = 4               # 并发“用户”数
+        RUN_SEC     = 10              # 并发时长
+
+        running = threading.Event()
+        running.set()
+        
+        def user_worker(user_id: int):
+            # 每个用户一份独立 db
+            client = dkvs.Client()
+            db = {}
+            self.append_data(client, db)
+
+            while running.is_set():
+                op = random.choice(['put', 'get', 'del'])
+                if op == 'put':
+                    self.append_data(client, db, n=1)
+                elif op == 'get':
+                    self.check_integrity(client, db, sample_k=1)
+                elif op == 'del':
+                    self.del_random_data(client, db, n=1)
+
+        # 启动线程池
+        with ThreadPoolExecutor(max_workers=USER_N) as pool:
+            futures = [pool.submit(user_worker, i) for i in range(USER_N)]
+
+            # 主线程 sleep 足够时间
+            time.sleep(RUN_SEC)
+            running.clear()          # 通知所有线程结束
+
+            # 等待全部线程完成，并“重放”异常
+            for f in as_completed(futures):
+                f.result()
+
+    def test_2streams10s_integrity_with_scale(self):
+        USER_N      = 4               # 并发“用户”数
+        RUN_SEC     = 10              # 并发时长
+
+        running = threading.Event()
+        running.set()
+        
+        def user_worker(user_id: int):
+            # 每个用户一份独立 db
+            client = dkvs.Client()
+            db = {}
+            self.append_data(client, db)
+
+            while running.is_set():
+                op = random.choice(['put', 'get', 'del'])
+                if op == 'put':
+                    self.append_data(client, db, n=1)
+                elif op == 'get':
+                    self.check_integrity(client, db, sample_k=1)
+                elif op == 'del':
+                    self.del_random_data(client, db, n=1)
+
+        # 启动线程池
+        with ThreadPoolExecutor(max_workers=USER_N) as pool:
+            futures = [pool.submit(user_worker, i) for i in range(USER_N)]
+
+            # 主线程 sleep 足够时间
+            time.sleep(RUN_SEC / 2)
+            # 增加两个存储节点
+            self.add_store()
+            self.add_store()
+            time.sleep(RUN_SEC / 2)
+            running.clear()          # 通知所有线程结束
+
+            # 等待全部线程完成，并“重放”异常
+            for f in as_completed(futures):
+                f.result()
+
+    def test_monotonic_read(self):
+        RUN_TIME    = 5          # 秒
+        KEY_RANGE   = 3          # 模拟 10 个 key
+
+        running = threading.Event()
+        running.set()
+
+        def read_worker():
+            client = dkvs.Client()
+            last_seen = [0 for _ in range(KEY_RANGE)]
+            while running.is_set():
+                read_no = random.randint(0, KEY_RANGE - 1)
+                ret: str = client.get(str(read_no)) # type: ignore
+                self.assertIsNotNone(ret)
+                seq_r = int(ret)
+                self.assertGreaterEqual(seq_r, last_seen[read_no])
+            
+        def write_worker():
+            client = dkvs.Client()
+            while running.is_set():
+                write_no = random.randint(0, KEY_RANGE - 1)
+                ret1: str = client.get(str(write_no)) # type: ignore
+                self.assertIsNotNone(ret1)
+                seq = int(ret1)
+                seq += 1
+                ret2 = client.put(str(write_no), str(seq))
+                self.assertTrue(ret2)
+        
+        # 写入初始值
+        client = dkvs.Client()
+        for i in range(KEY_RANGE):
+            ret = client.put(str(i), '0')
+            self.assertTrue(ret)
+
+        # 启动并发
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(read_worker), pool.submit(write_worker)]
+            time.sleep(RUN_TIME)
+            running.clear()
+            # 把异常带回主线程
+            for f in as_completed(futures):
+                f.result()          # 有异常会在这里重新抛
 
 if __name__ == "__main__":
     unittest.main()

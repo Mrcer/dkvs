@@ -19,7 +19,7 @@ class OrcheMain:
     """
     def __init__(self):
         # Store节点代理
-        self.store_states_lock = threading.Lock()
+        self.store_states_lock = threading.RLock()
         self.store_states = ConsistentHash(replicas=0)
         self.store_states_changed = False
 
@@ -69,9 +69,9 @@ class OrcheMain:
             logger.debug(f"[Orche] updating ring to stores")
             with self.store_states_lock:
                 infos = [n.to_dict() for n in self.store_states.get_all_nodes().values()]
-                for store_info in infos:
-                    with ServerProxy(store_info['addr'], allow_none=True) as proxy:
-                        proxy.update_ring(infos)
+            for store_info in infos:
+                with ServerProxy(store_info['addr'], allow_none=True) as proxy:
+                    proxy.update_ring(infos)
     
 class OrcheRPC:
     """协调节点RPC封装"""
