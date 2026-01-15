@@ -26,11 +26,13 @@ class LRUCache:
             self.hit_count += 1
             item = self.db[key]
             self.db[key] = (item[0], item[1], self.access_count)
+            logger.debug(f"[Cache] Get `{key}` cache hit, value is `{item[0]}`")
             return item[0], item[1]
         else:
             raise KeyError
 
     def shrink(self):
+        logger.debug(f"[Cache] Shrinking")
         all_items = list(self.db.items())
         all_items.sort(key=lambda x: x[1][1], reverse=True)
         old_items = all_items[self.max_size + 1:]
@@ -41,12 +43,16 @@ class LRUCache:
         if key not in self.db:
             self.db[key] = (val, version, 0)
         self.db[key] = (val, version, self.access_count)
+        logger.debug(f"[Cache] update `{key}` to `{val}` with version {version}")
         if len(self.db) > self.max_size * 1.5:
             self.shrink()
 
     def delete(self, key: str):
         if key in self.db:
+            logger.debug(f"[Cache] Delete `{key}`")
             del self.db[key]
+        else:
+            logger.debug(f"[Cache] `{key}` not found in cache")
 
 class Client:
     def __init__(self, orche_port=8000):

@@ -459,6 +459,21 @@ class TestIntegration(unittest.TestCase):
             ret = client.get(k)
             self.assertEqual(ret, v)
 
+    def modify_data(self, client: dkvs.Client, sim_db: dict, n=100):
+        if n > len(sim_db):
+            n = len(sim_db)
+        mod_items = random.sample(list(sim_db.items()), k=n)
+        for k, v in mod_items:
+            print(f'modifying {k}')
+            ret = client.get(k)
+            self.assertEqual(ret, v)
+            new_val = str(uuid4())
+            sim_db[k] = new_val
+            ret = client.put(k, new_val)
+            self.assertTrue(ret)
+            ret = client.get(k)
+            self.assertEqual(ret, new_val)
+
     def del_random_data(self, client: dkvs.Client, sim_db: dict, n=50):
         if n > len(sim_db):
             n = len(sim_db)
@@ -483,14 +498,21 @@ class TestIntegration(unittest.TestCase):
             ret = client.get(k)
             self.assertEqual(ret, v)
 
-    def test_appand(self):
+    def test_append(self):
         client = dkvs.Client()
         self.append_data(client, {})
 
-    def test_appand_and_del(self):
+    def test_modify(self):
         client = dkvs.Client()
         db = {}
         self.append_data(client, db)
+        self.modify_data(client, db)
+
+    def test_put_and_del(self):
+        client = dkvs.Client()
+        db = {}
+        self.append_data(client, db)
+        self.modify_data(client, db)
         self.del_random_data(client, db)
         self.check_integrity(client, db)
 
@@ -498,6 +520,7 @@ class TestIntegration(unittest.TestCase):
         client = dkvs.Client()
         db = {}
         self.append_data(client, db)
+        self.modify_data(client, db)
         self.add_store()
         time.sleep(3)
         self.append_data(client, db)
@@ -515,13 +538,15 @@ class TestIntegration(unittest.TestCase):
                 db = {}
                 self.append_data(client, db)
                 while running.is_set():
-                    op = random.choice(["put", "get", "del"])
+                    op = random.choice(["put", "get", "del", "mod"])
                     if op == "put":
                         self.append_data(client, db, n=1)
-                    if op == "get":
+                    elif op == "get":
                         self.check_integrity(client, db, sample_k=1)
-                    if op == "del":
+                    elif op == "del":
                         self.del_random_data(client, db, n=1)
+                    elif op == "mod":
+                        self.modify_data(client, db, n=1)
             except:
                 fail.set()
                 raise
@@ -549,13 +574,15 @@ class TestIntegration(unittest.TestCase):
             self.append_data(client, db)
 
             while running.is_set():
-                op = random.choice(["put", "get", "del"])
+                op = random.choice(["put", "get", "del", "mod"])
                 if op == "put":
                     self.append_data(client, db, n=1)
                 elif op == "get":
                     self.check_integrity(client, db, sample_k=1)
                 elif op == "del":
                     self.del_random_data(client, db, n=1)
+                elif op == "mod":
+                    self.modify_data(client, db, n=1)
 
         # 启动线程池
         with ThreadPoolExecutor(max_workers=USER_N) as pool:
@@ -583,13 +610,15 @@ class TestIntegration(unittest.TestCase):
             self.append_data(client, db)
 
             while running.is_set():
-                op = random.choice(["put", "get", "del"])
+                op = random.choice(["put", "get", "del", "mod"])
                 if op == "put":
                     self.append_data(client, db, n=1)
                 elif op == "get":
                     self.check_integrity(client, db, sample_k=1)
                 elif op == "del":
                     self.del_random_data(client, db, n=1)
+                elif op == "mod":
+                    self.modify_data(client, db, n=1)
 
         # 启动线程池
         with ThreadPoolExecutor(max_workers=USER_N) as pool:
