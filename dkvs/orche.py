@@ -136,14 +136,17 @@ class OrcheRPC:
 
 
 def run_orche(replicas, port=8000):
-    server = SimpleXMLRPCServer(("localhost", port), allow_none=True)
+    server = SimpleXMLRPCServer(("127.0.0.1", port), allow_none=True)
     orche = OrcheMain()
 
     rpc = OrcheRPC(orche)
     server.register_instance(rpc, allow_dotted_names=True)
 
     logger.info(f"[Orche] Running on port {port}...")
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        logger.info(f"[Orche] shutting down...")
 
 
 if __name__ == "__main__":

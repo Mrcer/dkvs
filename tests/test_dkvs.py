@@ -431,7 +431,7 @@ class TestIntegration(unittest.TestCase):
 
     def add_store(self):
         store = Process(
-            target=dkvs.run_store, args=["http://localhost:8000/"], daemon=True
+            target=dkvs.run_store, args=["http://127.0.0.1:8000/"], daemon=True
         )
         store.start()
         self.stores.append(store)

@@ -56,7 +56,7 @@ class LRUCache:
 
 class Client:
     def __init__(self, orche_port=8000):
-        self.orche_addr = f"http://localhost:{orche_port}"
+        self.orche_addr = f"http://127.0.0.1:{orche_port}"
         self.store_states = ConsistentHash(replicas=0)
         self.cache = LRUCache()
         self.update_ring()

@@ -10,6 +10,7 @@ import asyncio
 import random
 from typing import Literal
 from dataclasses import dataclass
+import socket
 
 logger = logging.getLogger("store")
 logging.basicConfig(level=logging.DEBUG)
@@ -540,7 +541,12 @@ def start_rpc_on_random_port(
 ) -> tuple[SimpleXMLRPCServer, int] | None:
     for port in port_range:
         try:
-            server = SimpleXMLRPCServer(("localhost", port), allow_none=True)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            sock.bind(('127.0.0.1', port))
+            server = SimpleXMLRPCServer(("127.0.0.1", port), allow_none=True, bind_and_activate=False)
+            server.socket = sock
+            server.server_activate()
         except OSError:
             continue
         else:
@@ -557,7 +563,7 @@ def run_store(orche_dest, port_range=range(10000, 20000)):
     server, port = res
     # 注册到协调节点同时启动 Store 实例
     orche = ServerProxy(orche_dest, allow_none=True)
-    store_id: str | None = orche.register("localhost", port)  # type: ignore
+    store_id: str | None = orche.register("127.0.0.1", port)  # type: ignore
     if store_id is None:
         logger.info("register failed.")
         return
@@ -574,7 +580,7 @@ def run_store(orche_dest, port_range=range(10000, 20000)):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--orche-dest", type=str, default=f"http://localhost:8000/", required=True
+        "--orche-dest", type=str, default=f"http://127.0.0.1:8000/", required=True
     )
     args = parser.parse_args()
     run_store(args.orche_dest)

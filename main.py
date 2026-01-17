@@ -13,7 +13,7 @@ def launch_cluster():
     procs.append(orche)
     for i in range(2):
         store = Process(
-            target=dkvs.run_store, args=["http://localhost:8000/"], daemon=True
+            target=dkvs.run_store, args=["http://127.0.0.1:8000/"], daemon=True
         )
         store.start()
         procs.append(store)
@@ -22,7 +22,8 @@ def launch_cluster():
 
 def wait_for_terminate(procs):
     try:
-        signal.sigwait({signal.SIGINT, signal.SIGTERM})
+        while True:
+            time.sleep(0.1)
     except KeyboardInterrupt:
         pass
     print("\nShutting down cluster…")
