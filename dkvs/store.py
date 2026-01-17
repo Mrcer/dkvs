@@ -542,8 +542,8 @@ def start_rpc_on_random_port(
     for port in port_range:
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
             sock.bind(('127.0.0.1', port))
+            # 不知道为什么，Windows 上直接开server不会因为端口占用而报错
             server = SimpleXMLRPCServer(("127.0.0.1", port), allow_none=True, bind_and_activate=False)
             server.socket = sock
             server.server_activate()
